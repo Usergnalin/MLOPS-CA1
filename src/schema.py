@@ -21,3 +21,8 @@ COLUMNS = {
 
 def file_name(table, postfix):
     return f"{table}_{postfix}.csv"
+
+# Canonical value formats: what the cleaning step writes and what the database load expects.
+ORDER_DATE_FORMAT = "%Y/%m/%d"
+FIRST_ORDER_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+BOOL_VALUES = ("True", "False")
