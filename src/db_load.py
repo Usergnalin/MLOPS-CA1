@@ -10,6 +10,11 @@ LOAD DATA LOCAL INFILE (fast for ~1M rows) and MySQL casts the values to their c
 insert, so a value that slipped past cleaning fails loudly instead of being silently coerced.
 All inserts of a batch are one transaction: a batch is loaded completely or not at all.
 
+Loading is safe to repeat. Rows are upserted on their primary key (see db_schema.py), so loading
+the same batch again changes nothing, and a later batch that contains an existing customer or
+order overwrites it; batch_id always records the batch that last wrote a row. Rejected rows are
+unique per (batch_id, source_table, source_row, reason), so re-runs don't pile up duplicates.
+
 In code:
     from src.db_load import run_batch
     stats = run_batch(engine, raw_dir, postfix)
@@ -25,7 +30,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from src import data_validate
-from src.db_schema import COLUMN_TYPES, REJECTS_TABLE, create_tables, q
+from src.db_schema import COLUMN_TYPES, PRIMARY_KEYS, REJECTS_TABLE, create_tables, q
 from src.schema import COLUMNS, FIRST_ORDER_DATETIME_FORMAT, ORDER_DATE_FORMAT, TABLE_NAMES
 
 log = logging.getLogger("db_load")
@@ -57,17 +62,27 @@ def cast_expr(column, ddl):
     return f"s.{column}"
 
 
-def insert_sql(table):
-    """INSERT ... SELECT from the staging table, casting every column to its type."""
+def upsert_sql(table):
+    """INSERT ... SELECT from the staging table, casting every column to its type.
+
+    On a primary-key clash the non-key columns (including batch_id) are overwritten.
+    """
     cols = COLUMNS[table] + ["batch_id"]
     exprs = [cast_expr(c, COLUMN_TYPES[table][c]) for c in COLUMNS[table]] + [":batch_id"]
     select = ",\n    ".join(f"{e} AS {q(c)}" for c, e in zip(cols, exprs))
+    updates = ",\n  ".join(f"{q(c)} = new.{q(c)}" for c in cols if c not in PRIMARY_KEYS[table])
     return (f"INSERT INTO {q(table)} ({', '.join(q(c) for c in cols)})\n"
-            f"SELECT * FROM (\n  SELECT\n    {select}\n  FROM {q(STAGING_PREFIX + table)} AS s\n) AS new")
+            f"SELECT * FROM (\n  SELECT\n    {select}\n  FROM {q(STAGING_PREFIX + table)} AS s\n) AS new\n"
+            f"ON DUPLICATE KEY UPDATE\n  {updates}")
 
 
 REJECTS_INSERT = (f"INSERT INTO {q(REJECTS_TABLE)} (batch_id, source_table, source_row, reason, raw_values) "
-                  "VALUES (:batch_id, :table, :row, :reason, :raw)")
+                  "VALUES (:batch_id, :table, :row, :reason, :raw) "
+                  "ON DUPLICATE KEY UPDATE id = id")  # already recorded: keep it
+
+
+def row_stats(rows, inserted):
+    return {"rows": rows, "inserted": inserted, "existing": rows - inserted}
 
 
 def count_rows(conn, table):
@@ -110,7 +125,10 @@ def check_input(tables, rejects):
 
 
 def load_batch(engine, tables, rejects, batch_id):
-    """Insert one cleaned batch and its rejected rows. Returns {table: rows inserted}.
+    """Upsert one cleaned batch and its rejected rows.
+
+    Returns {table: {"rows": rows in the batch, "inserted": new rows, "existing": rows that were
+    already in the table and got overwritten}}.
 
     tables:  {table: DataFrame of strings in the canonical formats from schema.py}
     rejects: DataFrame with REJECT_COLUMNS (table, row, reason, raw)
@@ -133,18 +151,18 @@ def load_batch(engine, tables, rejects, batch_id):
         with engine.begin() as conn:
             for t in TABLE_NAMES:
                 t0 = time.perf_counter()
-                sql = insert_sql(t)
+                sql = upsert_sql(t)
                 before = count_rows(conn, t)
                 conn.execute(text(sql), {k: v for k, v in params.items() if f":{k}" in sql})
-                stats[t] = count_rows(conn, t) - before
-                log.info("inserted %-9s %9d rows in %5.1fs", t, stats[t], time.perf_counter() - t0)
+                stats[t] = row_stats(len(tables[t]), count_rows(conn, t) - before)
+                log.info("upserted %-9s in %5.1fs", t, time.perf_counter() - t0)
             records = [{"batch_id": batch_id, "table": r.table, "row": int(r.row), "reason": r.reason,
                         "raw": r.raw if isinstance(r.raw, str) else json.dumps(r.raw)}
                        for r in rejects[REJECT_COLUMNS].itertuples(index=False)]
+            before = count_rows(conn, REJECTS_TABLE)
             if records:
                 conn.execute(text(REJECTS_INSERT), records)
-            stats[REJECTS_TABLE] = len(records)
-            log.info("inserted %-9s %9d rows", REJECTS_TABLE, len(records))
+            stats[REJECTS_TABLE] = row_stats(len(records), count_rows(conn, REJECTS_TABLE) - before)
     finally:
         try:
             with engine.begin() as conn:
@@ -152,6 +170,8 @@ def load_batch(engine, tables, rejects, batch_id):
                     conn.execute(text(f"DROP TABLE IF EXISTS {q(stg)}"))
         except SQLAlchemyError:
             log.warning("could not drop staging tables %s", staged)
+    for t, st in stats.items():
+        log.info("%-9s rows=%9d  inserted=%9d  existing=%9d", t, st["rows"], st["inserted"], st["existing"])
     return stats
 
 

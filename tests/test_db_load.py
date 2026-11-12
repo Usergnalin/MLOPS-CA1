@@ -29,17 +29,24 @@ def rows(engine, sql):
         return conn.execute(text(sql)).all()
 
 
-def test_insert_sql_casts_types():
-    sql = db_load.insert_sql("orders")
+def new(rows):
+    return {"rows": rows, "inserted": rows, "existing": 0}
+
+
+def test_upsert_sql_casts_types_and_updates_non_key_columns():
+    sql = db_load.upsert_sql("orders")
     assert "CAST(s.num_items_ordered AS SIGNED)" in sql
     assert "CAST(s.order_value AS DECIMAL(18,6))" in sql
     assert "STR_TO_DATE(s.order_date, :date_fmt)" in sql
+    updates = sql.split("ON DUPLICATE KEY UPDATE")[1]
+    assert "`batch_id` = new.`batch_id`" in updates
+    assert "`order_id`" not in updates and "`country_code`" not in updates  # keys are never updated
 
 
 def test_load_batch(engine):
     tables, rejects = batch()
     stats = db_load.load_batch(engine, tables, rejects, "b1")
-    assert stats == {"customers": 2, "orders": 2, "labels": 2, "rejects": 1}
+    assert stats == {"customers": new(2), "orders": new(2), "labels": new(2), "rejects": new(1)}
     c1, c2 = rows(engine, "SELECT mobile_verified, total_payment_last_50days, first_order_datetime, batch_id "
                           "FROM customers ORDER BY customer_id")
     assert (c1[0], float(c1[1]), str(c1[2]), c1[3]) == (1, 13.5, "2021-03-23 09:16:29", "b1")
@@ -88,6 +95,41 @@ def test_run_batch_validates_cleans_and_loads(engine, tmp_path):
 
     stats = db_load.run_batch(engine, tmp_path, "b2", clean=fake_clean)
     assert len(seen["orders"]) == 200
-    assert stats == {"customers": 2, "orders": 200, "labels": 200, "rejects": 2}
+    assert stats == {"customers": new(2), "orders": new(200), "labels": new(200), "rejects": new(2)}
     assert sorted(r[0] for r in rows(engine, "SELECT reason FROM rejects")) == [
         "customer_id not in customers", "malformed row: 2 fields, expected 8"]
+
+
+def counts(engine):
+    return {t: rows(engine, f"SELECT COUNT(*) FROM {t}")[0][0] for t in ["customers", "orders", "labels", "rejects"]}
+
+
+def test_loading_the_same_batch_twice_creates_no_duplicates(engine):
+    tables, rejects = batch()
+    db_load.load_batch(engine, tables, rejects, "b1")
+    first = counts(engine)
+    stats = db_load.load_batch(engine, tables, rejects, "b1")
+    assert counts(engine) == first
+    assert all(st["inserted"] == 0 and st["existing"] == st["rows"] for st in stats.values())
+
+
+def test_later_batch_updates_existing_rows_and_adds_new_ones(engine):
+    tables, rejects = batch(order_ids=["o1", "o2"])
+    db_load.load_batch(engine, tables, rejects, "b1")
+
+    tables, rejects = batch(order_ids=["o2", "o3"])
+    tables["labels"]["is_fraud"] = "0"                  # o2 relabelled by the operations team
+    tables["customers"].loc[0, "num_orders_last_50days"] = "9"  # newer customer snapshot
+    stats = db_load.load_batch(engine, tables, rejects, "b2")
+
+    assert stats["orders"] == {"rows": 2, "inserted": 1, "existing": 1}
+    assert stats["rejects"] == new(1)  # same row number, but a different batch
+    assert [tuple(r) for r in rows(engine, "SELECT order_id, is_fraud, batch_id FROM labels ORDER BY order_id")] == [
+        ("o1", 1, "b1"), ("o2", 0, "b2"), ("o3", 0, "b2")]
+    assert rows(engine, "SELECT num_orders_last_50days, batch_id FROM customers WHERE customer_id = 'c1'") == [(9, "b2")]
+
+
+def test_same_order_id_in_another_country_is_a_different_order(engine):
+    db_load.load_batch(engine, *batch(country="MY"), "b1")
+    db_load.load_batch(engine, *batch(country="PH"), "b2")
+    assert counts(engine)["orders"] == 4
