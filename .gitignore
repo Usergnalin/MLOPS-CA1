@@ -59,6 +59,8 @@ env/
 *.onnx
 
 # --- AWS / Elastic Beanstalk ---
+# Deployment zips are rebuilt from the files in the repo
+*.zip
 .elasticbeanstalk/*
 !.elasticbeanstalk/*.cfg.yml
 !.elasticbeanstalk/*.global.yml
