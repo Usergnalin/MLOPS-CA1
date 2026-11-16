@@ -26,10 +26,11 @@ from urllib.parse import unquote, urlparse
 
 import requests
 
+from src.schema import TABLE_NAMES, file_name
+
 log = logging.getLogger("data_download")
 
 RAW_DIR = Path(__file__).resolve().parents[1] / "data" / "raw"
-TABLE_NAMES = ["customers", "orders", "labels"]
 FILE_NAME = re.compile(r"^(?P<table>customers|orders|labels)_(?P<postfix>\w+)\.csv$")
 
 TIMEOUT = (10, 60)  # seconds: connect, and between bytes received
@@ -129,7 +130,7 @@ def run(urls=(), postfix=None, raw_dir=RAW_DIR, customers=None, orders=None, lab
     postfix, by_table = resolve_batch(urls, postfix, customers, orders, labels)
     raw_dir = Path(raw_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
-    paths = {t: raw_dir / f"{t}_{postfix}.csv" for t in by_table}
+    paths = {t: raw_dir / file_name(t, postfix) for t in by_table}
 
     start = time.perf_counter()
     with requests.Session() as session, ThreadPoolExecutor(len(by_table)) as pool:
