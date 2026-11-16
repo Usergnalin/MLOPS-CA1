@@ -4,7 +4,9 @@ import numpy as np
 import pandas as pd
 import pytest
 from mlflow.tracking import MlflowClient
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
 
 from src import tracking
 
@@ -75,6 +77,21 @@ def test_log_model_run_records_everything(local_store, fitted_model):
 
     artifacts = [a.path for a in MlflowClient().list_artifacts(result.run_id, "evaluation")]
     assert "evaluation/extra_results.json" in artifacts
+
+    import mlflow
+
+    loaded = mlflow.sklearn.load_model(result.model_uri)
+    assert list(loaded.predict(X)) == list(model.predict(X))
+
+
+@pytest.mark.parametrize("model_cls", [GradientBoostingClassifier, RandomForestClassifier, DecisionTreeClassifier])
+def test_tree_models_can_be_logged_and_loaded(local_store, fitted_model, model_cls):
+    # MLflow 3's default "skops" format rejects tree models; the helper must still log them.
+    _, X = fitted_model
+    y = np.array([0, 1, 0, 1, 0, 1])
+    model = model_cls(random_state=0).fit(X, y)
+
+    result = tracking.log_model_run(model, model_cls.__name__, experiment_name="test-experiment")
 
     import mlflow
 

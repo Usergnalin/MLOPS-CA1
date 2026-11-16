@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 from dataclasses import dataclass
 from numbers import Number
 from typing import Any, Mapping
@@ -113,6 +114,7 @@ def log_model_run(
     - tags: any other tags; ``model_type`` is always set to ``model_name``.
     """
     experiment_id = setup_mlflow(experiment_name, tracking_uri)
+    _allow_emoji_output()
 
     with mlflow.start_run(run_name=run_name or model_name) as run:
         mlflow.set_tags({"model_type": model_name, **_stringify(tags or {})})
@@ -127,10 +129,15 @@ def log_model_run(
         if other_results:
             mlflow.log_dict(other_results, "evaluation/extra_results.json")
 
+        # cloudpickle instead of MLflow 3's default "skops" format: skops rejects
+        # tree models (Decision Tree, Random Forest, Gradient Boosting, XGBoost)
+        # unless every internal type is listed by hand. Models are only loaded
+        # from the team's own server, so pickling is safe here.
         model_info = mlflow.sklearn.log_model(
             model,
             name="model",
             input_example=input_example,
+            serialization_format=mlflow.sklearn.SERIALIZATION_FORMAT_CLOUDPICKLE,
         )
 
     return RunResult(
@@ -139,6 +146,19 @@ def log_model_run(
         model_uri=model_info.model_uri,
         run_url=_run_url(experiment_id, run.info.run_id),
     )
+
+
+def _allow_emoji_output() -> None:
+    """MLflow prints "🏃 View run ..." when a run ends. On Windows, when output is
+    redirected (pipeline logs, piped terminals) that crashes with UnicodeEncodeError,
+    so unprintable characters are replaced instead."""
+    for stream in (sys.stdout, sys.stderr):
+        encoding = (getattr(stream, "encoding", None) or "").lower().replace("-", "")
+        if encoding != "utf8" and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
 
 
 def _clean_params(params: Mapping[str, Any]) -> dict[str, str]:
