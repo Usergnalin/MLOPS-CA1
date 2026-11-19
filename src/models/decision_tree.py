@@ -30,6 +30,7 @@ from sklearn.tree import DecisionTreeClassifier
 
 from src.config import TRAINING_DIR, setup_logging
 from src.data_fetch import TARGET, load_training_data
+from src.dataset_tags import dataset_tags  # shared with every model (#25)
 from src.evaluation import MAIN_METRICS, evaluate_model, format_metrics
 from src.tracking import DEFAULT_EXPERIMENT, log_model_run, setup_mlflow
 
@@ -66,18 +67,6 @@ def build_model(max_depth=8, min_samples_leaf=50):
     tree = DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_samples_leaf,
                                   class_weight="balanced", random_state=RANDOM_STATE)
     return Pipeline([("preprocess", preprocess), ("model", tree)])
-
-
-def dataset_tags(manifest):
-    """Which data a run used, from the data_fetch manifest (logged as dataset.<key> tags)."""
-    return {
-        "data_hash": manifest["data_hash"],
-        "batches": ",".join(manifest["batches"]),
-        "order_date_min": manifest["order_date_min"],
-        "order_date_max": manifest["order_date_max"],
-        "train_rows": manifest["train"]["rows"],
-        "test_rows": manifest["test"]["rows"],
-    }
 
 
 def run(training_dir=TRAINING_DIR, max_depth=8, min_samples_leaf=50, experiment=DEFAULT_EXPERIMENT,
