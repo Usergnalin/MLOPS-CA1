@@ -30,7 +30,8 @@ from sklearn.preprocessing import OneHotEncoder
 from src.config import TRAINING_DIR, setup_logging
 from src.data_fetch import TARGET, load_training_data
 from src.evaluation import compare_to_baseline, evaluate_model, format_metrics
-from src.models.decision_tree import CATEGORICAL, EXCLUDED, FEATURES, NUMERIC, baseline_metrics, dataset_tags
+from src.dataset_tags import dataset_tags
+from src.models.decision_tree import CATEGORICAL, EXCLUDED, FEATURES, NUMERIC, baseline_metrics
 from src.tracking import DEFAULT_EXPERIMENT, log_model_run
 
 log = logging.getLogger("gradient_boosting")
@@ -60,8 +61,12 @@ def build_model(learning_rate=0.1, max_iter=300, max_leaf_nodes=31, min_samples_
     return Pipeline([("preprocess", preprocess), ("model", boosting)])
 
 
-def run(training_dir=TRAINING_DIR, experiment=DEFAULT_EXPERIMENT, run_name=None, author=None, **hyperparams):
-    """Train, evaluate, compare with the baseline and log. Returns (metrics, comparison, RunResult)."""
+def run(training_dir=TRAINING_DIR, experiment=DEFAULT_EXPERIMENT, run_name=None, author=None, new_batch=None,
+        **hyperparams):
+    """Train, evaluate, compare with the baseline and log. Returns (metrics, comparison, RunResult).
+
+    new_batch: when retraining (#24), the batch that triggered it; logged as dataset.new_batch.
+    """
     params = {**DEFAULTS, **{k: v for k, v in hyperparams.items() if v is not None}}
     train, test, manifest = load_training_data(training_dir)
     # Fail before the long training run if there is nothing to compare with.
@@ -89,7 +94,7 @@ def run(training_dir=TRAINING_DIR, experiment=DEFAULT_EXPERIMENT, run_name=None,
                 "n_iter_no_change": 20, "random_state": RANDOM_STATE,
                 "features": ",".join(FEATURES), "excluded": ",".join(EXCLUDED)},
         metrics=metrics,
-        dataset_tags=dataset_tags(manifest),
+        dataset_tags=dataset_tags(manifest, new_batch=new_batch),
         experiment_name=experiment,
         run_name=run_name,
         tags={"author": author or getpass.getuser(),
@@ -115,8 +120,9 @@ if __name__ == "__main__":
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT, help="MLflow experiment name")
     parser.add_argument("--run-name", help="MLflow run name (default: gradient_boosting)")
     parser.add_argument("--author", help="author tag (default: OS user name)")
+    parser.add_argument("--new-batch", help="when retraining: the batch that triggered it (logged as dataset.new_batch)")
     args = parser.parse_args()
     setup_logging()
-    run(args.training_dir, args.experiment, args.run_name, args.author,
+    run(args.training_dir, args.experiment, args.run_name, args.author, new_batch=args.new_batch,
         learning_rate=args.learning_rate, max_iter=args.max_iter, max_leaf_nodes=args.max_leaf_nodes,
         min_samples_leaf=args.min_samples_leaf, l2_regularization=args.l2_regularization)

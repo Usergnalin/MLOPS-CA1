@@ -80,3 +80,12 @@ def test_run_logs_metrics_comparison_and_model(local_store, training_dir):
     _, test, _ = data_fetch.load_training_data(training_dir)
     rescored = evaluate_model(loaded, test[gb.FEATURES], test[data_fetch.TARGET])
     assert rescored["test_pr_auc"] == pytest.approx(run.data.metrics["test_pr_auc"])
+
+
+def test_retraining_run_records_the_new_batch(local_store, training_dir):
+    dt.run(training_dir, experiment="test-exp")
+    _, _, normal = gb.run(training_dir, experiment="test-exp", max_iter=10)
+    _, _, retrain = gb.run(training_dir, experiment="test-exp", max_iter=10, new_batch="base")
+
+    assert "dataset.new_batch" not in mlflow.get_run(normal.run_id).data.tags
+    assert mlflow.get_run(retrain.run_id).data.tags["dataset.new_batch"] == "base"
