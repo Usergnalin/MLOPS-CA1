@@ -7,7 +7,12 @@ and logs everything to MLflow (src.tracking).
 Unlike a tree, an MLP is sensitive to the scale of its inputs, so the heavy-tailed counts and
 amounts (a few customers have thousands of orders) are log1p'd and standardised first;
 categories are one-hot encoded. Early stopping holds out 10% of the fitting rows and stops once
-their score stops improving.
+their score hasn't improved for PATIENCE epochs.
+
+Speed. The whole pipeline has to run in 3 minutes (PBI-11), so the network is fitted on a random,
+fraud-rate-preserving sample of at most MAX_ROWS orders, with (64, 32) hidden units and large
+batches. On the base batch this trains in seconds instead of ~1 minute for ~0.016 less PR-AUC
+(validation 0.547 vs 0.563 for (128, 64) on every row). --max-rows 0 fits on every row.
 
 Threshold. An MLPClassifier has no class weights, so its probabilities are calibrated to the
 ~11% fraud rate and 0.5 flags too few orders. The threshold is chosen on a slice of the training
@@ -22,7 +27,7 @@ Features are the baseline's (same columns, same leak exclusions), so the compari
 Usage:
     python -m src.models.decision_tree          # the baseline must exist for the same data first
     python -m src.models.mlp
-    python -m src.models.mlp --hidden 64 32 --min-recall 0.85
+    python -m src.models.mlp --hidden 128 64 --max-rows 0 --min-recall 0.85   # slower, slightly better
 """
 import argparse
 import getpass
@@ -52,11 +57,12 @@ RANDOM_STATE = 42
 THRESHOLD_FRACTION = 0.15  # of the training rows, held out to choose the threshold
 FLAGS = ["mobile_verified"]                          # already 0/1
 LOG_SCALED = [c for c in NUMERIC if c not in FLAGS]  # counts and amounts: log1p, then standardise
-DEFAULTS = {"hidden": (128, 64), "alpha": 1e-4, "learning_rate": 1e-3, "batch_size": 1024, "max_iter": 200,
+DEFAULTS = {"hidden": (64, 32), "alpha": 1e-4, "learning_rate": 3e-3, "batch_size": 4096, "max_iter": 200,
+            "patience": 5, "max_rows": 300_000,
             "min_recall": 0.80}
 
 
-def build_model(hidden=(128, 64), alpha=1e-4, learning_rate=1e-3, batch_size=1024, max_iter=200):
+def build_model(hidden=(64, 32), alpha=1e-4, learning_rate=3e-3, batch_size=4096, max_iter=200, patience=5):
     preprocess = ColumnTransformer(
         [
             # handle_unknown="ignore": a payment method first seen in a new batch won't crash scoring.
@@ -69,7 +75,7 @@ def build_model(hidden=(128, 64), alpha=1e-4, learning_rate=1e-3, batch_size=102
     )
     mlp = MLPClassifier(
         hidden_layer_sizes=tuple(hidden), alpha=alpha, learning_rate_init=learning_rate,
-        batch_size=batch_size, max_iter=max_iter, early_stopping=True, n_iter_no_change=10,
+        batch_size=batch_size, max_iter=max_iter, early_stopping=True, n_iter_no_change=patience,
         random_state=RANDOM_STATE,
     )
     return Pipeline([("preprocess", preprocess), ("model", mlp)])
@@ -86,13 +92,17 @@ def choose_threshold(y_true, y_score, min_recall):
     return threshold_for_recall(y_true, y_score, min_recall) if min_recall else tune_threshold(y_true, y_score)
 
 
-def fit_with_threshold(X, y, min_recall=0.80, **params):
-    """Fit on most of the training rows, choose the threshold on the rest.
+def fit_with_threshold(X, y, min_recall=0.80, max_rows=300_000, **params):
+    """Fit on most of the training rows (at most max_rows of them), choose the threshold on the rest.
 
     Returns (model with the threshold baked in, threshold, fitted pipeline).
     """
     X_fit, X_thr, y_fit, y_thr = train_test_split(X, y, test_size=THRESHOLD_FRACTION, stratify=y,
                                                   random_state=RANDOM_STATE)
+    if max_rows and len(X_fit) > max_rows:
+        # Stratified, so the sample keeps the fraud rate; the threshold slice stays full size.
+        X_fit, _, y_fit, _ = train_test_split(X_fit, y_fit, train_size=max_rows, stratify=y_fit,
+                                              random_state=RANDOM_STATE)
     pipeline = build_model(**params).fit(X_fit, y_fit)
     threshold = choose_threshold(y_thr, pipeline.predict_proba(X_thr)[:, 1], min_recall)
     # FrozenEstimator: fit() below only records the classes, the MLP is not retrained.
@@ -157,6 +167,8 @@ if __name__ == "__main__":
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--max-iter", type=int, help="max epochs (early stopping usually ends sooner)")
+    parser.add_argument("--patience", type=int, help="stop after this many epochs without improvement (default 5)")
+    parser.add_argument("--max-rows", type=int, help="fit on at most this many orders (default 300000; 0 = all)")
     parser.add_argument("--min-recall", type=float,
                         help="share of fraud the threshold must catch (default 0.80); 0 = best F1 instead")
     parser.add_argument("--training-dir", default=TRAINING_DIR, help="data written by src.data_fetch")
@@ -168,4 +180,5 @@ if __name__ == "__main__":
     setup_logging()
     run(args.training_dir, args.experiment, args.run_name, args.author, new_batch=args.new_batch,
         hidden=tuple(args.hidden) if args.hidden else None, alpha=args.alpha, learning_rate=args.learning_rate,
-        batch_size=args.batch_size, max_iter=args.max_iter, min_recall=args.min_recall)
+        batch_size=args.batch_size, max_iter=args.max_iter, patience=args.patience, max_rows=args.max_rows,
+        min_recall=args.min_recall)
