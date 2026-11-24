@@ -107,3 +107,31 @@ def test_retraining_run_records_the_new_batch(local_store, training_dir):
     _, _, retrain = mlp.run(training_dir, experiment="test-exp", hidden=(8,), max_iter=20, new_batch="base")
     assert "dataset.new_batch" not in mlflow.get_run(normal.run_id).data.tags
     assert mlflow.get_run(retrain.run_id).data.tags["dataset.new_batch"] == "base"
+
+
+def test_fits_on_a_capped_sample_but_chooses_the_threshold_on_the_full_slice(training_dir, monkeypatch):
+    seen = {}
+    real_build = mlp.build_model
+
+    def spy_build(**params):
+        model = real_build(**params)
+        real_fit = model.fit
+        def fit(X, y):
+            seen["rows"], seen["fraud_rate"] = len(X), float(y.mean())
+            return real_fit(X, y)
+        model.fit = fit
+        return model
+
+    monkeypatch.setattr(mlp, "build_model", spy_build)
+    train, _, _ = data_fetch.load_training_data(training_dir)
+    X, y = train[mlp.FEATURES], train[data_fetch.TARGET]
+    mlp.fit_with_threshold(X, y, 0.8, max_rows=200, hidden=(8,), max_iter=20)
+    assert seen["rows"] == 200
+    assert abs(seen["fraud_rate"] - y.mean()) < 0.02                 # stratified: fraud rate kept
+    mlp.fit_with_threshold(X, y, 0.8, max_rows=0, hidden=(8,), max_iter=20)
+    assert seen["rows"] == len(X) - round(len(X) * mlp.THRESHOLD_FRACTION)  # 0 = every fitting row
+
+
+def test_defaults_are_the_fast_settings():
+    assert mlp.DEFAULTS["hidden"] == (64, 32) and mlp.DEFAULTS["max_rows"] == 300_000
+    assert mlp.DEFAULTS["patience"] == 5 and mlp.DEFAULTS["batch_size"] == 4096
