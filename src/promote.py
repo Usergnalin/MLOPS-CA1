@@ -168,6 +168,22 @@ def select_and_promote(experiment=DEFAULT_EXPERIMENT, training_dir=TRAINING_DIR,
     return decision
 
 
+
+def run(postfix=None, **kwargs):
+    """Pipeline step 'promote' (src/pipeline.py): select_and_promote() in the pipeline's summary format.
+
+    postfix is not needed (the candidates are the runs on the current data) but is part of the step
+    contract. Returns {"promoted", "model_version", "mlflow_url", "decision"}.
+    """
+    decision = select_and_promote(**kwargs)
+    uri = mlflow.get_tracking_uri()
+    version = decision.get("champion_version")
+    url = None
+    if uri.startswith("http") and version is not None:
+        url = f"{uri.rstrip('/')}/#/models/{kwargs.get('registered_model', REGISTERED_MODEL)}/versions/{version}"
+    return {"promoted": decision["promoted"], "model_version": version, "mlflow_url": url, "decision": decision}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT, help="MLflow experiment name")

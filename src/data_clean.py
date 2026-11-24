@@ -420,16 +420,19 @@ def for_load(raw: dict, add_flags: bool = False) -> tuple[dict, pd.DataFrame]:
     """
     result = clean_all(raw, add_flags=add_flags)
     cleaned = {name: df[load_schema.COLUMNS[name]].apply(_load_text) for name, df in result.clean.items()}
-    rejects = []
-    for name, rej in result.rejects.items():
-        values = rej[SCHEMA[name]]
-        rejects.append(pd.DataFrame({
-            "table": name,
-            "row": rej["raw_row"].astype(int),
-            "reason": rej["reject_reason"],
-            "raw": [json.dumps(r, default=str) for r in values.to_dict("records")],
-        }, columns=LOAD_REJECT_COLUMNS))
+    rejects = [load_rejects(name, rej) for name, rej in result.rejects.items()]
     return cleaned, pd.concat(rejects, ignore_index=True)
+
+
+def load_rejects(name: str, rej: pd.DataFrame) -> pd.DataFrame:
+    """One table's rejects (raw_row, reject_reason, raw columns) as the load's table/row/reason/raw."""
+    values = rej[[c for c in SCHEMA[name] if c in rej.columns]]
+    return pd.DataFrame({
+        "table": name,
+        "row": rej["raw_row"].astype(int),
+        "reason": rej["reject_reason"],
+        "raw": [json.dumps(r, default=str) for r in values.to_dict("records")],
+    }, columns=LOAD_REJECT_COLUMNS)
 
 
 def read_raw_table(path: Path) -> pd.DataFrame:
