@@ -54,6 +54,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:  # `python src/pipeline.py`: the step modules import each other as src.<module>
+    sys.path.insert(0, str(ROOT))
 DEFAULT_REPORT_DIR = ROOT / "data" / "reports"
 DEFAULT_MLFLOW_PIPELINE_EXPERIMENT = "pipeline-runs"
 
@@ -122,8 +124,8 @@ class PipelineError(RuntimeError):
 # Finding and running steps
 # ---------------------------------------------------------------------------
 def _import(module: str):
-    """Import `module` as a top-level module (script style) or as src.<module> (package style)."""
-    for name in (module, f"src.{module}"):
+    """Import src.<module> (package style), or `module` as a top-level module (script style)."""
+    for name in (f"src.{module}", module):
         try:
             return importlib.import_module(name)
         except ModuleNotFoundError as exc:
