@@ -176,13 +176,12 @@ def load_batch(engine, tables, rejects, batch_id):
 
 
 def default_clean(tables):
-    """The team cleaning module (PBI-02): data_clean.clean_all(customers, orders, labels).
+    """The team cleaning module (PBI-02), in load format: data_clean.for_load({table: DataFrame}).
 
-    Expected to return (cleaned {table: DataFrame}, rejects DataFrame with REJECT_COLUMNS, ...).
+    Returns (cleaned {table: DataFrame of canonical strings}, rejects DataFrame with REJECT_COLUMNS).
     """
     from src import data_clean  # imported here so loading doesn't depend on it when a clean function is given
-    cleaned, rejects, *_ = data_clean.clean_all(tables["customers"], tables["orders"], tables["labels"])
-    return cleaned, rejects
+    return data_clean.for_load(tables)
 
 
 def run_batch(engine, raw_dir, postfix, clean=default_clean):

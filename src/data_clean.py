@@ -17,6 +17,7 @@ From other code (e.g. a Prefect flow or a test):
     from src.data_clean import run, clean_all
     result = run(postfix="base")                  # reads + cleans + writes
     result = clean_all({"customers": df1, "orders": df2, "labels": df3})   # in memory only
+    cleaned, rejects = for_load(raw)              # what src.db_load inserts (src/schema.py formats)
 
 Output conventions (the loader / training code can rely on these):
     * ids are lower-case 10-char hex, country_code is upper-case, dates are ISO (YYYY-MM-DD)
@@ -39,10 +40,12 @@ import pandas as pd
 
 try:  # run as a script from src/ (like the notebook) ...
     from config import CLEAN_DIR, RAW_DIR, setup_logging
+    import schema as load_schema
 except ModuleNotFoundError as exc:  # ... or imported as src.data_clean (like the tests)
     if exc.name != "config":
         raise
     from src.config import CLEAN_DIR, RAW_DIR, setup_logging
+    from src import schema as load_schema
 
 log = logging.getLogger("data_clean")
 
@@ -389,6 +392,44 @@ def clean_all(raw: dict, add_flags: bool = True) -> CleanResult:
             "kept_but_noted": dict(sorted(res.rj.notes.items(), key=lambda kv: -kv[1])),
         }
     return out
+
+
+# ---------------------------------------------------------------------------
+# Hand-off to the database load (src.db_load)
+# ---------------------------------------------------------------------------
+LOAD_FORMATS = {"order_date": load_schema.ORDER_DATE_FORMAT,
+                "first_order_datetime": load_schema.FIRST_ORDER_DATETIME_FORMAT}
+LOAD_REJECT_COLUMNS = ["table", "row", "reason", "raw"]  # = data_validate.REJECT_COLUMNS
+
+
+def _load_text(s: pd.Series) -> pd.Series:
+    """One cleaned column as the strings src.db_load stages; missing values become ''."""
+    if s.name in LOAD_FORMATS:
+        return s.dt.strftime(LOAD_FORMATS[s.name]).fillna("")
+    if s.name == "mobile_verified":
+        true, false = load_schema.BOOL_VALUES
+        return s.map({1: true, 0: false}).fillna("").astype(str)
+    return s.astype("string").fillna("").astype(str)
+
+
+def for_load(raw: dict, add_flags: bool = False) -> tuple[dict, pd.DataFrame]:
+    """clean_all() in the shape src.db_load.load_batch expects.
+
+    Returns ({table: DataFrame of strings in src/schema.py's columns and formats},
+             one rejects DataFrame with columns table, row, reason, raw).
+    """
+    result = clean_all(raw, add_flags=add_flags)
+    cleaned = {name: df[load_schema.COLUMNS[name]].apply(_load_text) for name, df in result.clean.items()}
+    rejects = []
+    for name, rej in result.rejects.items():
+        values = rej[SCHEMA[name]]
+        rejects.append(pd.DataFrame({
+            "table": name,
+            "row": rej["raw_row"].astype(int),
+            "reason": rej["reject_reason"],
+            "raw": [json.dumps(r, default=str) for r in values.to_dict("records")],
+        }, columns=LOAD_REJECT_COLUMNS))
+    return cleaned, pd.concat(rejects, ignore_index=True)
 
 
 def read_raw_table(path: Path) -> pd.DataFrame:
