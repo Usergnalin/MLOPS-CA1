@@ -158,3 +158,14 @@ def test_no_runs_gives_clear_error(local_store, tmp_path):
     empty = write_training_dir(tmp_path / "e", "hash-none", seed=2)
     with pytest.raises(LookupError, match="train the models first"):
         run_promote(empty)
+
+
+def test_shortlist_takes_the_best_run_of_each_model_type(local_store, tmp_path):
+    d = write_training_dir(tmp_path / "t", "hash-1")
+    log_run(d, "same", GOOD)
+    log_run(d, "same", OK)  # a second, weaker run of the same model type
+    log_run(d, "other", BAD)
+
+    decision = run_promote(d, dry_run=True)
+
+    assert [s["model_type"] for s in decision["shortlist"]] == ["same", "other"]

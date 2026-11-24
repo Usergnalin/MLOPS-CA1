@@ -1,10 +1,11 @@
-"""Pick the production model: shortlist the top 2 and keep the best as @champion (#27, #28).
+"""Pick the production model: shortlist the top 2 model types and keep the best as @champion (#27, #28).
 
 Run after the models of a pipeline run have been trained and logged (PBI-04 AC2, AC3):
 
 1. Candidates are the finished runs in the experiment that were trained on the current data
    (same dataset.data_hash as the data_fetch manifest) and have a test PR-AUC.
-2. The top 2 by test_pr_auc are registered as versions of one registered model in the MLflow
+2. Only the best run of each model type counts (retraining the same model twice can't fill both
+   places). The top 2 model types by test_pr_auc are registered as versions of one registered model in the MLflow
    Model Registry and shortlisted: the best gets alias @challenger, the second @runner_up.
 3. The challenger is compared with the current @champion. The champion may have been trained on
    older data, so it is re-scored on the *current* test set first; both are then judged on the
@@ -55,6 +56,14 @@ def candidate_runs(data_hash, experiment=DEFAULT_EXPERIMENT):
     return runs
 
 
+def best_per_model_type(runs):
+    """Keep each model type's best run (runs come sorted best first); untagged runs count on their own."""
+    if runs.empty:
+        return runs
+    model_type = runs.get("tags.model_type", runs["run_id"]).fillna(runs["run_id"])
+    return runs[~model_type.duplicated()]
+
+
 def logged_model_uri(run_id, experiment_id):
     """models:/<id> URI of the model logged by a run (src.tracking logs exactly one)."""
     models = mlflow.search_logged_models(experiment_ids=[experiment_id],
@@ -103,7 +112,7 @@ def select_and_promote(experiment=DEFAULT_EXPERIMENT, training_dir=TRAINING_DIR,
     setup_mlflow(experiment)
     client = MlflowClient()
 
-    runs = candidate_runs(data_hash, experiment)
+    runs = best_per_model_type(candidate_runs(data_hash, experiment))
     if runs.empty:
         raise LookupError(f"no finished runs with {RANKING_METRIC} for data {data_hash[:12]} in {experiment!r} - "
                           "train the models first")
