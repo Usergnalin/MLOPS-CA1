@@ -109,3 +109,96 @@ def test_query_and_dtypes_follow_the_shared_table_design():
         assert set(COLUMNS[table]) <= set(df_.OUTPUT_COLUMNS)
     assert set(df_.DTYPES) | set(df_.DATETIME_COLUMNS) == set(df_.OUTPUT_COLUMNS)
     assert df_.DTYPES["is_fraud"] == "int8" and df_.DTYPES["mobile_verified"] == "bool"
+
+
+# --- incremental fetch -------------------------------------------------------------------------
+
+def load(engine, batch, orders, customers, labels=None):
+    """Load a batch. orders: [(order_id, customer_id, is_fraud)]; customers: [(customer_id, num_orders)]."""
+    cust = pd.DataFrame([["MY", c, "True", str(n), "0", "0", "10.5", "1", "2021-03-23 09:16:29"] for c, n in customers],
+                        columns=COLUMNS["customers"])
+    ords = pd.DataFrame([["MY", o, "Delivery", "balance", "5.25", "2", "0.5", "2023/01/15"] for o, _, _ in orders],
+                        columns=COLUMNS["orders"])
+    labs = pd.DataFrame([["MY", o, c, str(f)] for o, c, f in (labels or orders)], columns=COLUMNS["labels"])
+    db_load.load_batch(engine, {"customers": cust, "orders": ords, "labels": labs},
+                       pd.DataFrame(columns=REJECT_COLUMNS), batch)
+
+
+BASE = [(f"o{i:03d}", f"k{i % 20}", int(i % 4 == 0)) for i in range(200)]
+BASE_CUSTOMERS = [(f"k{i}", 5) for i in range(20)]
+
+
+def hashes(manifest):
+    return manifest["train"]["hash"], manifest["test"]["hash"]
+
+
+def test_incremental_fetches_only_the_new_batch_and_matches_a_full_fetch(db, tmp_path):
+    load(db, "base", BASE, BASE_CUSTOMERS)
+    first = df_.run(tmp_path / "snap", engine=db)[2]
+    assert first["fetch"]["mode"] == "full" and "no usable snapshot" in first["fetch"]["reason"]
+
+    load(db, "b2", [(f"n{i:02d}", "new0", int(i % 3 == 0)) for i in range(30)], [("new0", 1)])
+    inc = df_.run(tmp_path / "snap", engine=db)[2]
+    full = df_.run(tmp_path / "full", engine=db, full=True)[2]
+
+    assert inc["fetch"] == {"mode": "incremental", "batches_fetched": ["b2"], "rows_from_database": 30,
+                            "rows_from_snapshot": 200}
+    assert hashes(inc) == hashes(full) and inc["data_hash"] == full["data_hash"]   # byte-identical files
+    assert inc["batches"] == {"base": 200, "b2": 30}
+
+
+def test_nothing_new_means_nothing_fetched(db, tmp_path):
+    load(db, "base", BASE, BASE_CUSTOMERS)
+    first = df_.run(tmp_path, engine=db)[2]
+    again = df_.run(tmp_path, engine=db)[2]
+    assert again["fetch"]["rows_from_database"] == 0 and again["fetch"]["batches_fetched"] == []
+    assert hashes(again) == hashes(first)
+
+
+def test_customer_updated_by_a_later_batch_refreshes_their_old_orders(db, tmp_path):
+    load(db, "base", BASE, BASE_CUSTOMERS)
+    df_.run(tmp_path / "snap", engine=db)
+    load(db, "b2", [("n01", "k3", 1)], [("k3", 99)])          # k3's snapshot changes: 99 orders now
+    inc_train, inc_test, inc = df_.run(tmp_path / "snap", engine=db)
+    full = df_.run(tmp_path / "full", engine=db, full=True)[2]
+    assert inc["fetch"]["mode"] == "incremental" and inc["fetch"]["rows_from_database"] == 11  # k3's 10 + n01
+    assert hashes(inc) == hashes(full)
+    both = pd.concat([inc_train, inc_test])
+    assert (both.loc[both["customer_id"] == "k3", "num_orders_last_50days"] == 99).all()
+
+
+def test_relabel_inside_an_old_batch_is_caught_and_falls_back_to_full(db, tmp_path):
+    load(db, "base", BASE, BASE_CUSTOMERS)
+    df_.run(tmp_path, engine=db)
+    with db.begin() as conn:  # a label changes without a new batch_id: counts no longer match
+        conn.execute(text("UPDATE labels SET is_fraud = 1 - is_fraud WHERE order_id = 'o001'"))
+    m = df_.run(tmp_path, engine=db)[2]
+    assert m["fetch"]["mode"] == "full" and "don't match the database" in m["fetch"]["reason"]
+
+
+def test_refresh_rereads_the_batch_being_processed(db, tmp_path):
+    load(db, "base", BASE, BASE_CUSTOMERS)
+    load(db, "b2", [(f"n{i:02d}", "new0", 0) for i in range(10)], [("new0", 1)])
+    df_.run(tmp_path, engine=db)
+    m = df_.run(tmp_path, engine=db, refresh=["b2"])[2]
+    assert m["fetch"]["batches_fetched"] == ["b2"] and m["fetch"]["rows_from_database"] == 10
+
+
+def test_snapshot_from_another_database_is_not_reused(db, tmp_path):
+    load(db, "base", BASE, BASE_CUSTOMERS)
+    df_.run(tmp_path, engine=db)
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    manifest["host"] = "some-other-server"
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    m = df_.run(tmp_path, engine=db)[2]
+    assert m["fetch"]["mode"] == "full" and "some-other-server" in m["fetch"]["reason"]
+
+
+def test_full_fetch_flag_and_environment(db, tmp_path, monkeypatch):
+    load(db, "base", BASE, BASE_CUSTOMERS)
+    df_.run(tmp_path, engine=db)
+    assert df_.run(tmp_path, engine=db, full=True)[2]["fetch"]["reason"] == "full fetch requested"
+    monkeypatch.setenv("FETCH_MODE", "full")
+    assert df_.run(tmp_path, engine=db)[2]["fetch"]["mode"] == "full"
+    monkeypatch.setenv("FETCH_MODE", "incremental")
+    assert df_.run(tmp_path, engine=db)[2]["fetch"]["mode"] == "incremental"
