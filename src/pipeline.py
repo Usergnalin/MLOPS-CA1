@@ -4,6 +4,7 @@
     python src/pipeline.py --postfix batch_02      # a new raw drop: data/raw/<table>_batch_02.csv
     python src/pipeline.py --skip clean,load       # re-use data that is already loaded
     python src/pipeline.py --only retrain,promote
+    python src/pipeline.py --full-fetch            # re-read all training data from MySQL (default: only new batches)
     python src/pipeline.py --check                 # validate step modules without running them
     python src/pipeline.py --time-budget 180 --strict-budget   # exit code 2 if over 3 minutes
 
@@ -601,7 +602,11 @@ def main(argv: list[str] | None = None) -> int:
         help=f"MLflow experiment for pipeline summary runs (default: {DEFAULT_MLFLOW_PIPELINE_EXPERIMENT})",
     )
     p.add_argument("--webhook-url", default=None, help="optional webhook URL for team notifications")
+    p.add_argument("--full-fetch", action="store_true",
+                   help="retrain: re-read all training data from MySQL instead of only new batches")
     args = p.parse_args(argv)
+    if args.full_fetch:
+        os.environ["FETCH_MODE"] = "full"  # read by src.data_fetch inside the retrain step
 
     setup_logging()
 

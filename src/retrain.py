@@ -1,6 +1,8 @@
 """Pipeline step 'retrain': fetch the latest data and retrain every model on it (PBI-11, #24).
 
-1. src.data_fetch writes a fresh train / test snapshot from MySQL (all loaded batches).
+1. src.data_fetch writes a fresh train / test snapshot from MySQL (all loaded batches). By default
+   only new batches and the batch being processed are read from the database (incremental);
+   --full-fetch / FETCH_MODE=full re-reads everything.
 2. The decision tree baseline is trained first: every other model compares itself with it.
 3. Each model in MODELS is trained and logged to MLflow, tagged dataset.new_batch=<postfix>
    so the registry shows which batch triggered the retraining.
@@ -65,11 +67,16 @@ def train(module, new_batch, training_dir, experiment):
     return out[0], out[-1]  # every model returns (metrics, ..., RunResult)
 
 
-def run(postfix="base", models=None, training_dir=TRAINING_DIR, experiment=DEFAULT_EXPERIMENT, fetch=True):
-    """Fetch the latest data and retrain the models. Returns the summary dict described above."""
+def run(postfix="base", models=None, training_dir=TRAINING_DIR, experiment=DEFAULT_EXPERIMENT, fetch=True,
+        full_fetch=None):
+    """Fetch the latest data and retrain the models. Returns the summary dict described above.
+
+    full_fetch: None follows $FETCH_MODE (default incremental); True re-reads the whole database.
+    """
     names = model_list(models)
     if fetch:
-        data_fetch.run(training_dir)
+        # The batch being processed is always re-read, so a re-loaded batch is never stale.
+        data_fetch.run(training_dir, full=full_fetch, refresh=[postfix])
 
     urls, scores, skipped = [], {}, []
     for name in names:
@@ -94,7 +101,9 @@ if __name__ == "__main__":
     parser.add_argument("--postfix", default="base", help="the batch that triggered the retraining")
     parser.add_argument("--models", help=f"comma-separated subset of: {', '.join(MODELS)}")
     parser.add_argument("--no-fetch", action="store_true", help="re-use the snapshot in data/training")
+    parser.add_argument("--full-fetch", action="store_true", help="re-read all data from the database")
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT, help="MLflow experiment name")
     args = parser.parse_args()
     setup_logging()
-    run(args.postfix, args.models, experiment=args.experiment, fetch=not args.no_fetch)
+    run(args.postfix, args.models, experiment=args.experiment, fetch=not args.no_fetch,
+        full_fetch=True if args.full_fetch else None)

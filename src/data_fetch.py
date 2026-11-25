@@ -15,8 +15,19 @@ in the lowest TEST_PERCENT of buckets. The assignment depends only on the order 
 never changes between runs; when new batches arrive, old test orders stay in test and new
 orders are split the same way. No order that was ever used for testing leaks into training.
 
+Incremental fetch (default). Pulling all ~1M rows from a remote database is slow over a slow link
+(17s next to the database, 20+ minutes from Singapore to the us-east-1 RDS), and almost all of
+them haven't changed since the last fetch. So when data/training already holds a snapshot of the
+same database, only rows touched by batches the snapshot doesn't have yet (plus the batch being
+processed, see `refresh`) are fetched, and merged into the snapshot. The database stays the
+source of truth: afterwards the per-batch row and fraud counts are compared with the database,
+and any mismatch (or a missing/foreign/edited snapshot) falls back to a full fetch. The result is
+the same file a full fetch would write, so it hashes the same.
+Full fetch: --full, or FETCH_MODE=full in the environment (src.pipeline --full-fetch sets it).
+
 Usage:
-    python -m src.data_fetch
+    python -m src.data_fetch                    # incremental if possible, else full
+    python -m src.data_fetch --full             # always re-read everything from the database
     python -m src.data_fetch --training-dir X
 
 In a training script:
@@ -34,7 +45,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from tqdm import tqdm
 
 from src.config import TRAINING_DIR, make_engine, setup_logging
@@ -73,15 +84,24 @@ def join_on(left, right, key):
     return " AND ".join(f"{right}.{c} = {left}.{c}" for c in key)
 
 
-QUERY = (
-    "SELECT\n    " + ",\n    ".join(SELECT_COLUMNS) + "\n"
+JOINS = (
     "FROM orders AS o\n"
     f"JOIN labels AS l\n    ON {join_on('o', 'l', ORDER_KEY)}\n"
     f"JOIN customers AS c\n    ON {join_on('l', 'c', CUSTOMER_KEY)}\n"
 )
+SELECT = "SELECT\n    " + ",\n    ".join(SELECT_COLUMNS) + "\n" + JOINS
+ORDER_BY = "ORDER BY " + ", ".join(f"o.{c}" for c in ORDER_KEY) + "\n"  # stable row order, so files hash the same
+QUERY = SELECT + ORDER_BY
 # Same joins, only for the progress bar total.
-COUNT_QUERY = f"SELECT COUNT(*) FROM ({QUERY}) AS q"
-QUERY += "ORDER BY " + ", ".join(f"o.{c}" for c in ORDER_KEY) + "\n"  # stable row order, so files hash the same
+COUNT_QUERY = f"SELECT COUNT(*) FROM ({SELECT}) AS q"
+# Incremental fetch: the labelled rows that a given set of batches wrote or touched (an order, its
+# label or its customer row last written by one of them), and the per-batch totals to check against.
+DELTA_QUERY = (SELECT + "WHERE o.batch_id IN :batches OR l.batch_id IN :batches OR c.batch_id IN :batches\n"
+               + ORDER_BY)
+BATCH_SUMMARY = f"SELECT o.batch_id, COUNT(*) AS n_rows, SUM(l.{TARGET}) AS fraud_rows\n{JOINS}GROUP BY o.batch_id"
+DB_BATCHES = ("SELECT batch_id FROM orders UNION SELECT batch_id FROM labels "
+              "UNION SELECT batch_id FROM customers")
+FETCH_MODE_ENV = "FETCH_MODE"  # "full" forces a full fetch; anything else (default) = incremental
 
 
 def pandas_dtype(column, ddl):
@@ -144,6 +164,69 @@ def fetch(engine):
     return set_types(pd.concat(chunks, ignore_index=True))
 
 
+def fetch_delta(engine, batches):
+    """Labelled rows written or touched by these batches (see DELTA_QUERY), typed."""
+    query = text(DELTA_QUERY).bindparams(bindparam("batches", expanding=True))
+    with engine.connect() as conn:
+        df = pd.read_sql(query, conn, params={"batches": sorted(batches)})
+    return set_types(df) if len(df) else df
+
+
+def db_batches(engine):
+    with engine.connect() as conn:
+        return {r[0] for r in conn.execute(text(DB_BATCHES))}
+
+
+def batch_summary(engine):
+    """{batch_id: (labelled rows, fraud rows)} as the database sees it."""
+    with engine.connect() as conn:
+        return {r[0]: (int(r[1]), int(r[2] or 0)) for r in conn.execute(text(BATCH_SUMMARY))}
+
+
+def summarise(df):
+    g = df.groupby("batch_id", observed=True)[TARGET].agg(["size", "sum"])
+    return {str(b): (int(n), int(f)) for b, (n, f) in g.iterrows()}
+
+
+def load_cache(training_dir, engine):
+    """The last snapshot as one DataFrame, or (None, reason) if it can't be reused for this database."""
+    try:
+        train, test, manifest = load_training_data(training_dir)
+    except (FileNotFoundError, RuntimeError, ValueError, KeyError) as exc:
+        return None, f"no usable snapshot ({exc})"
+    if (manifest.get("host"), manifest.get("database")) != (engine.url.host, engine.url.database):
+        return None, (f"snapshot is from {manifest.get('database')}@{manifest.get('host')}, "
+                      f"not {engine.url.database}@{engine.url.host}")
+    return pd.concat([train, test], ignore_index=True), None
+
+
+def merge(cached, delta):
+    """Replace cached rows that the delta also has, add the new ones, keep the database's row order."""
+    if len(delta):
+        keys = pd.MultiIndex.from_frame(delta[ORDER_KEY])
+        cached = pd.concat([cached[~pd.MultiIndex.from_frame(cached[ORDER_KEY]).isin(keys)], delta[cached.columns]],
+                           ignore_index=True)
+    return cached.sort_values(ORDER_KEY, kind="stable", ignore_index=True)
+
+
+def fetch_incremental(engine, training_dir, refresh=()):
+    """(df, info) from the snapshot plus the rows of new / refreshed batches, or (None, reason)."""
+    cached, reason = load_cache(training_dir, engine)
+    if cached is None:
+        return None, reason
+    in_db = db_batches(engine)
+    new = (in_db - set(cached["batch_id"].unique())) | (set(refresh) & in_db)
+    delta = fetch_delta(engine, new) if new else cached.iloc[0:0]
+    df = merge(cached, delta)
+    expected, got = batch_summary(engine), summarise(df)
+    if got != expected:
+        diff = {b: (got.get(b), expected.get(b)) for b in set(got) | set(expected) if got.get(b) != expected.get(b)}
+        return None, f"snapshot + new rows don't match the database (batch: (snapshot, database)) {diff}"
+    info = {"mode": "incremental", "batches_fetched": sorted(new),
+            "rows_from_database": len(delta), "rows_from_snapshot": len(df) - len(delta)}
+    return df, info
+
+
 def describe(df, digest):
     return {
         "rows": len(df),
@@ -187,8 +270,18 @@ def write_csv(df, path):
     return file_hash(path)
 
 
-def run(training_dir=TRAINING_DIR, engine=None):
-    """Fetch and split. Returns (train, test, manifest)."""
+def full_fetch_requested(full=None):
+    """--full / full=True, else FETCH_MODE=full in the environment."""
+    return bool(full) if full is not None else os.environ.get(FETCH_MODE_ENV, "").lower() == "full"
+
+
+def run(training_dir=TRAINING_DIR, engine=None, full=None, refresh=()):
+    """Fetch and split. Returns (train, test, manifest).
+
+    full: True re-reads everything from the database; None (default) follows $FETCH_MODE, which
+    defaults to incremental. refresh: batches to re-fetch even if the snapshot already has them
+    (the pipeline passes the batch it is processing, so a re-loaded batch is never stale).
+    """
     start = time.perf_counter()
     training_dir = Path(training_dir)
     training_dir.mkdir(parents=True, exist_ok=True)
@@ -196,11 +289,22 @@ def run(training_dir=TRAINING_DIR, engine=None):
     own_engine = engine is None
     engine = engine or make_engine()
     try:
-        df = fetch(engine)
+        df = None
+        if full_fetch_requested(full):
+            reason = "full fetch requested"
+        else:
+            df, info = fetch_incremental(engine, training_dir, refresh)
+            reason = None if df is not None else info
+        if df is None:
+            log.info("full fetch: %s", reason)
+            df = fetch(engine)
+            info = {"mode": "full", "reason": reason, "rows_from_database": len(df), "rows_from_snapshot": 0}
     finally:
         if own_engine:
             engine.dispose()
-    log.info("fetched %d rows in %.1fs", len(df), time.perf_counter() - start)
+    log.info("%s fetch: %d rows in %.1fs (%d from the database, %d from the snapshot%s)", info["mode"], len(df),
+             time.perf_counter() - start, info["rows_from_database"], info["rows_from_snapshot"],
+             f", batches fetched: {', '.join(info['batches_fetched']) or 'none'}" if "batches_fetched" in info else "")
 
     test_mask = is_test(df)
     train, test = df[~test_mask], df[test_mask]
@@ -213,6 +317,7 @@ def run(training_dir=TRAINING_DIR, engine=None):
         test_hash = write_csv(test, training_dir / TEST_FILE)
         bar.update()
     manifest = build_manifest(df, train, test, train_hash, test_hash, engine)
+    manifest["fetch"] = info
     write_atomic(training_dir / MANIFEST_FILE,
                  lambda p: p.write_text(json.dumps(manifest, indent=2) + "\n"))
 
@@ -248,6 +353,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--training-dir", type=Path, default=TRAINING_DIR,
                         help="output folder (default: %(default)s)")
+    parser.add_argument("--full", action="store_true", help="re-read everything from the database")
+    parser.add_argument("--refresh", default="", help="comma-separated batches to re-fetch even if cached")
     args = parser.parse_args()
     setup_logging()
-    run(args.training_dir)
+    run(args.training_dir, full=True if args.full else None,
+        refresh=[b for b in args.refresh.split(",") if b])
